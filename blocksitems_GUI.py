@@ -1,81 +1,71 @@
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+import threading
 import tkinter as tk
-from tkinter import colorchooser
+from tkinter import colorchooser, ttk
+from PIL import Image, ImageTk
 
-# Optional: Uncomment these imports later when you load real API data and images
-# import requests
-# from io import BytesIO
-# from PIL import Image, ImageTk
+import blocksitems_API as bi
 
 
 # =============================================================================
-# PLACEHOLDER CONFIGURATION
-# Replace the placeholder URLs and data below with your real API endpoints.
+# API CONFIGURATION (pulled directly from blocksitems_API.py)
 # =============================================================================
-BASE_URL = "PLACEHOLDER_BASE_URL"  # e.g. "https://blocksitems.com/api/2026.1.3"
-
-CATEGORIES = ["Items", "Blocks", "Mods", "Modpacks", "All"]
-
-# Placeholder API response matching the exact structure used in blocksitems_API.py
-# plus an "image_url" placeholder field for the item picture.
-PLACEHOLDER_DATA = {
-    "data": [
-        {
-            "display_name": "Placeholder Item 1",
-            "mod": {"display_name": "Placeholder Mod A"},
-            "mc_versions": ["1.20.1", "1.20.4", "1.21"],
-            "image_url": "PLACEHOLDER_IMAGE_URL_1",
-        },
-        {
-            "display_name": "Placeholder Item 2",
-            "mod": {"display_name": "Placeholder Mod B"},
-            "mc_versions": ["1.19.2", "1.20.1"],
-            "image_url": "PLACEHOLDER_IMAGE_URL_2",
-        },
-        {
-            "display_name": "Placeholder Item 3",
-            "mod": {"display_name": "Placeholder Mod C"},
-            "mc_versions": ["1.18.2", "1.19.2", "1.20.1", "1.21.1"],
-            "image_url": "PLACEHOLDER_IMAGE_URL_3",
-        },
-    ],
-    "pagination": {
-        "limit": 10,
-        "page": 1,
-        "total": 5,
-    },
-}
+BASE_URL = bi.url.rstrip("/")
+CATEGORIES = list(bi.categories)  # ["Items", "Blocks", "Mods", "Modpacks", "All"]
+SUB_CATEGORIES = [c for c in CATEGORIES if c != "All"]
+RESULTS_PER_PAGE = 50
+IMAGE_SIZE = 76
 
 
 # =============================================================================
-# GLOBAL STATE VARIABLES
+# GLOBAL STATE
 # =============================================================================
-selected_category = "Items"
-selected_color_hex = None  # Optional color picker result (e.g. "#3498db") or None
+selected_category = CATEGORIES[0]
+selected_color_hex = None  # Optional color picker hex code (e.g. "#3498db") or None
 current_page = 1
 total_pages = 1
-loaded_images = []  # Keeps references to loaded PhotoImages so Tkinter doesn't clear them
+total_items_count = 0
+search_generation = 0  # Tracks active search so stale background results are ignored
+
+loaded_images = []  # Keeps PhotoImage references alive for the current page
+pil_image_cache = {}  # Caches downloaded PIL images by URL for instant revisits
+info_wrap_labels = []  # Labels whose wraplength updates on window resize
+
+# Reusable HTTP session + thread pool for non-blocking API calls and image loading
+http_session = bi.requests.Session()
+image_executor = ThreadPoolExecutor(max_workers=8)
 
 
 # =============================================================================
-# THEME COLORS
+# DARK THEME COLORS
 # =============================================================================
-BG_MAIN = "#1e1f26"
-BG_PANEL = "#282a36"
-BG_CARD = "#2f3241"
-BG_INPUT = "#16171d"
-BG_IMAGE_BOX = "#1a1b23"
-BORDER_COLOR = "#44475a"
+BG_MAIN = "#14151a"
+BG_PANEL = "#1e2028"
+BG_CARD = "#252834"
+BG_INPUT = "#111217"
+BG_IMAGE_BOX = "#161820"
+BORDER_COLOR = "#34384a"
 
 ACCENT = "#2ea043"
 ACCENT_HOVER = "#3fb950"
-BTN_INACTIVE = "#343746"
-BTN_INACTIVE_HOVER = "#414558"
-BTN_CLEAR = "#4a3238"
+BTN_INACTIVE = "#2b2e3c"
+BTN_INACTIVE_HOVER = "#383c4e"
+BTN_CLEAR = "#3e272e"
+BTN_CLEAR_HOVER = "#53333c"
 BTN_CLEAR_TEXT = "#f38ba8"
 
-TEXT_PRIMARY = "#f8f8f2"
+BADGE_COLORS = {
+    "Items": "#2b5c8f",
+    "Blocks": "#2e6f40",
+    "Mods": "#6c4694",
+    "Modpacks": "#945a28",
+}
+
+TEXT_PRIMARY = "#f3f4f8"
 TEXT_SECONDARY = "#a6accd"
-TEXT_MUTED = "#6c7086"
+TEXT_MUTED = "#6c728a"
+TEXT_ERROR = "#f38ba8"
 
 
 # =============================================================================
@@ -108,92 +98,284 @@ class PlaceholderEntry(tk.Entry):
         if not self.get():
             self._show_placeholder()
 
+    def set_placeholder(self, new_placeholder):
+        """Update placeholder text without erasing anything the user already typed."""
+        self.placeholder = new_placeholder
+        if self.showing_placeholder:
+            self.delete(0, tk.END)
+            self.insert(0, self.placeholder)
+
     def get_value(self):
-        """Return the typed text, or an empty string if only the placeholder is shown."""
+        """Return typed text, or empty string when only the placeholder is visible."""
         if self.showing_placeholder:
             return ""
         return self.get().strip()
 
 
 # =============================================================================
-# PLACEHOLDER API & IMAGE FUNCTIONS
-# Replace the bodies of these functions with your real URLs / API calls.
+# COLOR HELPERS
 # =============================================================================
-def build_url(category, query, mc_version="", mod_name="", color_hex=None, page=1):
-    """
-    Build the API request URL from the GUI inputs.
-    PLACEHOLDER: Replace the endpoint paths and query parameter names with your real API format.
-    """
-    if category != "All":
-        url = f"{BASE_URL}/{category.lower()}?q={query.lower()}"
-    else:
-        url = f"{BASE_URL}/search?q={query.lower()}&scope=all"
-
-    # Optional Minecraft Version filter (PLACEHOLDER parameter name)
-    if mc_version:
-        url += f"&PLACEHOLDER_VERSION_PARAM={mc_version}"
-
-    # Optional Mod Name filter (PLACEHOLDER parameter name)
-    if mod_name:
-        url += f"&PLACEHOLDER_MOD_PARAM={mod_name}"
-
-    # Optional Color Hex filter (PLACEHOLDER parameter name)
-    if color_hex:
-        url += f"&PLACEHOLDER_COLOR_PARAM={color_hex}"
-
-    # Pagination parameter (PLACEHOLDER parameter name)
-    url += f"&page={page}"
-    return url
+def _hex_to_rgb(hex_str):
+    cleaned = hex_str.lstrip("#")
+    if len(cleaned) != 6:
+        return None
+    try:
+        return (int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16))
+    except ValueError:
+        return None
 
 
-def fetch_data(url):
-    """
-    Fetch JSON data from the API.
-    PLACEHOLDER: Uncomment the requests lines below to fetch real data from your URL.
-    """
-    # response = requests.get(url)
-    # return response.json()
+def _color_distance(hex_a, hex_b):
+    rgb_a = _hex_to_rgb(hex_a)
+    rgb_b = _hex_to_rgb(hex_b)
+    if not rgb_a or not rgb_b:
+        return float("inf")
+    return sum((a - b) ** 2 for a, b in zip(rgb_a, rgb_b))
 
-    # Return placeholder data with the current page updated for previewing the GUI
-    placeholder_response = {
-        "data": PLACEHOLDER_DATA["data"],
-        "pagination": {
-            "limit": PLACEHOLDER_DATA["pagination"]["limit"],
-            "page": current_page,
-            "total": PLACEHOLDER_DATA["pagination"]["total"],
-        },
+
+def _block_color_distance(item, target_hex):
+    colors = item.get("colors") or {}
+    best = float("inf")
+    dominant = colors.get("dominant")
+    if dominant:
+        best = min(best, _color_distance(dominant, target_hex))
+    for swatch in colors.get("palette") or []:
+        swatch_hex = swatch.get("hex")
+        if swatch_hex:
+            best = min(best, _color_distance(swatch_hex, target_hex))
+    return best
+
+
+# =============================================================================
+# REAL API REQUESTS (using blocksitems_API.url and blocksitems_API.requests)
+# =============================================================================
+def _fetch_single_category(category, query, mc_version, mod_name, color_hex, page):
+    """Fetch one page (50 results) for a single category from BlocksItems API."""
+    mod_slug = mod_name.strip().lower().replace(" ", "-") if mod_name else ""
+
+    # Color search endpoint when filtering Blocks purely by color
+    if category == "Blocks" and color_hex and not query:
+        params = {
+            "hex": color_hex.lstrip("#"),
+            "limit": RESULTS_PER_PAGE,
+        }
+        response = http_session.get(f"{BASE_URL}/colors/search", params=params, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+
+        results = []
+        for entry in payload.get("data", []):
+            block = entry.get("block") or {}
+            if mc_version and mc_version not in (block.get("mc_versions") or []):
+                continue
+            if mod_slug:
+                b_mod = block.get("mod") or {}
+                mod_match = (
+                    mod_slug in (b_mod.get("slug") or "").lower()
+                    or mod_name.lower() in (b_mod.get("display_name") or "").lower()
+                )
+                if not mod_match:
+                    continue
+            block_copy = dict(block)
+            block_copy["_category"] = "Blocks"
+            block_copy["_matched_hex"] = entry.get("hex")
+            results.append(block_copy)
+
+        return {
+            "data": results[:RESULTS_PER_PAGE],
+            "pagination": {
+                "page": 1,
+                "limit": RESULTS_PER_PAGE,
+                "pages": 1,
+                "total": len(results),
+            },
+            "url": response.url,
+        }
+
+    # Standard category endpoints matching blocksitems_API.py
+    endpoint = f"{BASE_URL}/{category.lower()}"
+    params = {
+        "limit": RESULTS_PER_PAGE,
+        "page": page,
     }
-    return placeholder_response
+    if query:
+        params["q"] = query.lower()
+
+    # Optional filters supported by each endpoint
+    if category in ("Items", "Blocks", "Modpacks"):
+        if mc_version:
+            params["mc_version"] = mc_version
+        if mod_slug:
+            params["mod"] = mod_slug
+    elif category == "Mods" and mod_name and not query:
+        params["q"] = mod_name.lower()
+
+    response = http_session.get(endpoint, params=params, timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+
+    items = []
+    for entry in payload.get("data", []):
+        item_copy = dict(entry)
+        item_copy["_category"] = category
+        items.append(item_copy)
+
+    # Local version filter for /mods (API /mods endpoint doesn't have an mc_version param)
+    if category == "Mods" and mc_version:
+        items = [it for it in items if mc_version in (it.get("mc_versions") or [])]
+
+    # Sort returned blocks by color closeness when combining text query + color picker
+    if category == "Blocks" and color_hex:
+        items.sort(key=lambda it: _block_color_distance(it, color_hex))
+
+    pagination = payload.get("pagination") or {}
+    return {
+        "data": items,
+        "pagination": {
+            "page": pagination.get("page", page),
+            "limit": pagination.get("limit", RESULTS_PER_PAGE),
+            "pages": max(1, pagination.get("pages", 1)),
+            "total": pagination.get("total", len(items)),
+        },
+        "url": response.url,
+    }
 
 
-def load_item_image(image_url, image_label):
-    """
-    Load an item image into the given Label widget.
-    PLACEHOLDER: Replace this with your real image download/display code (e.g. requests + Pillow).
-    """
-    # Example for when you hook up real image URLs (requires Pillow: pip install pillow):
-    #
-    # if image_url:
-    #     response = requests.get(image_url)
-    #     pil_image = Image.open(BytesIO(response.content)).resize((80, 80))
-    #     tk_image = ImageTk.PhotoImage(pil_image)
-    #     loaded_images.append(tk_image)
-    #     image_label.configure(image=tk_image, text="")
-    #     return
+def fetch_api_results(category, query, mc_version, mod_name, color_hex, page):
+    """Fetch results for the chosen category (or all 4 categories combined for 'All')."""
+    if category != "All":
+        return _fetch_single_category(category, query, mc_version, mod_name, color_hex, page)
 
-    image_label.configure(
-        text=f"Image\nPlaceholder\n\n({image_url or 'No URL'})",
-        fg=TEXT_MUTED,
+    # For "All" with only a color picked (no search query), use /colors/search directly
+    if color_hex and not query:
+        return _fetch_single_category("Blocks", "", mc_version, mod_name, color_hex, 1)
+
+    # Same logic as blocksitems_API.py "All": query Items, Blocks, Mods, Modpacks
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            cat: pool.submit(
+                _fetch_single_category, cat, query, mc_version, mod_name, color_hex, page
+            )
+            for cat in SUB_CATEGORIES
+        }
+
+        per_cat_items = {}
+        max_pages = 1
+        combined_total = 0
+
+        for cat in SUB_CATEGORIES:
+            try:
+                res = futures[cat].result()
+                per_cat_items[cat] = res["data"]
+                max_pages = max(max_pages, res["pagination"]["pages"])
+                combined_total += res["pagination"]["total"]
+            except Exception:
+                per_cat_items[cat] = []
+
+    # Round-robin pick up to RESULTS_PER_PAGE (50) balanced across non-empty categories
+    combined_items = []
+    idx = 0
+    while len(combined_items) < RESULTS_PER_PAGE:
+        added_any = False
+        for cat in SUB_CATEGORIES:
+            cat_list = per_cat_items.get(cat, [])
+            if idx < len(cat_list):
+                combined_items.append(cat_list[idx])
+                added_any = True
+                if len(combined_items) >= RESULTS_PER_PAGE:
+                    break
+        if not added_any:
+            break
+        idx += 1
+
+    return {
+        "data": combined_items,
+        "pagination": {
+            "page": page,
+            "limit": RESULTS_PER_PAGE,
+            "pages": max_pages,
+            "total": combined_total,
+        },
+        "url": f"{BASE_URL}/[items|blocks|mods|modpacks]?q={query.lower()}&limit={RESULTS_PER_PAGE}&page={page}",
+    }
+
+
+# =============================================================================
+# ASYNC IMAGE LOADING
+# =============================================================================
+def _download_pil_image(image_url):
+    if image_url in pil_image_cache:
+        return pil_image_cache[image_url]
+
+    resp = http_session.get(image_url, timeout=10)
+    resp.raise_for_status()
+    img = Image.open(BytesIO(resp.content)).convert("RGBA")
+
+    # Preserve pixel-art sharpness for tiny textures, smooth resize for larger icons/renders
+    resample = (
+        Image.Resampling.NEAREST
+        if max(img.size) <= 32
+        else Image.Resampling.LANCZOS
     )
+    img.thumbnail((IMAGE_SIZE, IMAGE_SIZE), resample)
+
+    # Keep cache bounded so memory stays low across many pages
+    if len(pil_image_cache) > 400:
+        pil_image_cache.clear()
+    pil_image_cache[image_url] = img
+    return img
+
+
+def load_item_image_async(image_url, image_label, gen):
+    """Download and render an item's PNG icon/render in the background."""
+    if not image_url:
+        image_label.configure(text="No Image", fg=TEXT_MUTED)
+        return
+
+    # Instant path if already cached
+    if image_url in pil_image_cache:
+        tk_img = ImageTk.PhotoImage(pil_image_cache[image_url])
+        loaded_images.append(tk_img)
+        image_label.configure(image=tk_img, text="")
+        return
+
+    image_label.configure(text="...", fg=TEXT_MUTED)
+
+    def _worker():
+        try:
+            pil_img = _download_pil_image(image_url)
+        except Exception:
+            pil_img = None
+
+        def _apply():
+            if gen != search_generation or not image_label.winfo_exists():
+                return
+            if pil_img is None:
+                image_label.configure(text="No Image", fg=TEXT_MUTED)
+                return
+            tk_img = ImageTk.PhotoImage(pil_img)
+            loaded_images.append(tk_img)
+            image_label.configure(image=tk_img, text="")
+
+        try:
+            root.after(0, _apply)
+        except tk.TclError:
+            pass
+
+    image_executor.submit(_worker)
 
 
 # =============================================================================
 # GUI ACTIONS
 # =============================================================================
 def select_category(category_name):
+    """Select one of the 5 categories (equivalent to answering 'What are you looking for?')."""
     global selected_category, current_page
     selected_category = category_name
     current_page = 1
+
+    # Keep blocksitems_API's variable synced as well
+    bi.userinputcat = category_name
 
     for name, btn in category_buttons.items():
         if name == selected_category:
@@ -213,18 +395,23 @@ def select_category(category_name):
                 font=("Segoe UI", 10),
             )
 
-    status_var.set(f"Category selected: {selected_category}")
+    if selected_category != "All":
+        prompt_text = f"What {selected_category.removesuffix('s')} are you looking for?"
+    else:
+        prompt_text = "What are you looking for? (Searches Items, Blocks, Mods, Modpacks)"
+    main_search_entry.set_placeholder(prompt_text)
+
+    status_var.set(f"Selected category: {selected_category} — type a query and press Enter or Search.")
 
 
 def pick_color():
     """Open the color picker and save the chosen hex code to `selected_color_hex`."""
     global selected_color_hex
-    initial_color = selected_color_hex if selected_color_hex else "#2ea043"
+    initial = selected_color_hex if selected_color_hex else "#2ea043"
     _rgb, hex_code = colorchooser.askcolor(
-        color=initial_color,
+        color=initial,
         title="Pick a Color (Optional)",
     )
-
     if hex_code:
         selected_color_hex = hex_code
         color_preview.configure(bg=selected_color_hex)
@@ -232,44 +419,73 @@ def pick_color():
 
 
 def clear_color():
-    """Reset the optional color selection back to None."""
+    """Clear the optional color selection."""
     global selected_color_hex
     selected_color_hex = None
     color_preview.configure(bg=BG_INPUT)
     color_hex_label.configure(text="None", fg=TEXT_MUTED)
 
 
-def showfounddata(data):
-    """
-    Display found items inside the middle scrollable results window,
-    showing the same fields as showfounddata() in blocksitems_API.py
-    plus a dedicated space for each item's picture.
-    """
-    # Clear previous result cards and image references
+def _clear_results_area():
     for widget in results_container.winfo_children():
         widget.destroy()
     loaded_images.clear()
+    info_wrap_labels.clear()
+
+
+def _show_message_in_results(text, color=TEXT_MUTED):
+    _clear_results_area()
+    tk.Label(
+        results_container,
+        text=text,
+        bg=BG_PANEL,
+        fg=color,
+        font=("Segoe UI", 11),
+        pady=50,
+        wraplength=650,
+        justify="center",
+    ).pack(fill="x")
+    results_canvas.yview_moveto(0)
+
+
+def _current_wraplength():
+    canvas_w = results_canvas.winfo_width()
+    if canvas_w <= 1:
+        canvas_w = 820
+    return max(260, canvas_w - 170)
+
+
+def showfounddata(data, gen):
+    """
+    Render the found items inside the scrollable middle list:
+    - Picture on the left (icon_url / render_url)
+    - Name in big bold text next to it
+    - Below the name: the exact information printed in the terminal by blocksitems_API.py
+    """
+    _clear_results_area()
 
     items = data.get("data", [])
+    pagination = data.get("pagination", {})
+    total_found = pagination.get("total", len(items))
+
     results_header_label.configure(
-        text=f"Found {selected_category} ({len(items)} shown)"
+        text=f"Found {selected_category}: showing {len(items)} on this page ({total_found:,} total)"
     )
 
     if not items:
-        empty_label = tk.Label(
-            results_container,
-            text="No results found.",
-            bg=BG_PANEL,
-            fg=TEXT_MUTED,
-            font=("Segoe UI", 11),
-            pady=40,
+        _show_message_in_results(
+            "No results found. Try a different search term or adjust your optional filters."
         )
-        empty_label.pack(fill="x")
         return
 
-    category_singular = selected_category.removesuffix("s")
+    wrap_len = _current_wraplength()
 
     for item in items:
+        item_cat = item.get("_category", selected_category)
+        if item_cat == "All":
+            item_cat = "Items"
+        cat_singular = item_cat.removesuffix("s")
+
         card = tk.Frame(
             results_container,
             bg=BG_CARD,
@@ -278,113 +494,259 @@ def showfounddata(data):
             padx=12,
             pady=10,
         )
-        card.pack(fill="x", padx=10, pady=6)
+        card.pack(fill="x", padx=10, pady=5)
 
-        # --- Extra Space for the Found Item's Picture ---
+        # --- Left: Picture of the Item / Block / Mod / Modpack ---
         image_frame = tk.Frame(
             card,
-            width=96,
-            height=96,
+            width=84,
+            height=84,
             bg=BG_IMAGE_BOX,
             highlightbackground=BORDER_COLOR,
             highlightthickness=1,
         )
-        image_frame.pack(side="left", padx=(0, 14))
+        image_frame.pack(side="left", anchor="n", padx=(0, 14))
         image_frame.pack_propagate(False)
 
         image_label = tk.Label(
             image_frame,
             bg=BG_IMAGE_BOX,
             fg=TEXT_MUTED,
-            font=("Segoe UI", 7),
+            font=("Segoe UI", 8),
             justify="center",
-            wraplength=88,
         )
         image_label.pack(expand=True, fill="both")
-        load_item_image(item.get("image_url", "PLACEHOLDER_IMAGE_URL"), image_label)
 
-        # --- Item Info (matching showfounddata in blocksitems_API.py) ---
+        image_url = item.get("icon_url") or item.get("render_url")
+        load_item_image_async(image_url, image_label, gen)
+
+        # --- Right: Name in Big + Terminal Info Below ---
         info_frame = tk.Frame(card, bg=BG_CARD)
         info_frame.pack(side="left", fill="both", expand=True)
 
-        display_name = item.get("display_name", "Unknown")
-        tk.Label(
-            info_frame,
-            text=f"{category_singular}: {display_name}",
+        # Title Row: Name in big + subtle category badge
+        title_row = tk.Frame(info_frame, bg=BG_CARD)
+        title_row.pack(fill="x", pady=(0, 5))
+
+        display_name = item.get("display_name") or item.get("full_id") or "Unknown"
+        name_label = tk.Label(
+            title_row,
+            text=display_name,
             bg=BG_CARD,
             fg=TEXT_PRIMARY,
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 14, "bold"),
             anchor="w",
-        ).pack(fill="x", pady=(0, 4))
+            justify="left",
+            wraplength=wrap_len - 80,
+        )
+        name_label.pack(side="left", fill="x", expand=True)
+        info_wrap_labels.append(name_label)
 
-        # Show Mod name for Items and Blocks (or whenever mod data exists in "All")
-        if selected_category in ("Items", "Blocks") or (
-            selected_category == "All" and "mod" in item
-        ):
-            mod_name = item.get("mod", {}).get("display_name", "Unknown Mod")
+        badge_bg = BADGE_COLORS.get(item_cat, BTN_INACTIVE)
+        tk.Label(
+            title_row,
+            text=cat_singular,
+            bg=badge_bg,
+            fg="#ffffff",
+            font=("Segoe UI", 8, "bold"),
+            padx=8,
+            pady=2,
+        ).pack(side="right", anchor="n", padx=(8, 0))
+
+        # --- Info printed in terminal by blocksitems_API.py ---
+        if item_cat in ("Items", "Blocks"):
+            mod_info = item.get("mod") or {}
+            mod_display = mod_info.get("display_name") or mod_info.get("slug") or "Unknown"
             tk.Label(
                 info_frame,
-                text=f"Mod: {mod_name}",
+                text=f"Mod: {mod_display}",
                 bg=BG_CARD,
                 fg=TEXT_SECONDARY,
                 font=("Segoe UI", 10),
                 anchor="w",
-            ).pack(fill="x", pady=(0, 4))
+            ).pack(fill="x", pady=(0, 3))
 
-        versions = item.get("mc_versions", [])
-        versions_text = ", ".join(versions) if versions else "None"
-        tk.Label(
-            info_frame,
-            text=f"Versions: {versions_text}",
-            bg=BG_CARD,
-            fg=TEXT_SECONDARY,
-            font=("Segoe UI", 9),
-            anchor="w",
-            justify="left",
-            wraplength=560,
-        ).pack(fill="x")
+            versions = item.get("mc_versions") or []
+            versions_text = ", ".join(versions) if versions else "None"
+            ver_lbl = tk.Label(
+                info_frame,
+                text=f"Versions: {versions_text}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify="left",
+                wraplength=wrap_len,
+            )
+            ver_lbl.pack(fill="x")
+            info_wrap_labels.append(ver_lbl)
 
-    # Scroll back to top after updating results
+            # Show matched color badge if returned from Color Search or dominant block color
+            matched_hex = item.get("_matched_hex") or (item.get("colors") or {}).get("dominant")
+            if matched_hex and selected_color_hex:
+                color_row = tk.Frame(info_frame, bg=BG_CARD)
+                color_row.pack(fill="x", pady=(4, 0))
+                tk.Frame(
+                    color_row,
+                    width=12,
+                    height=12,
+                    bg=matched_hex,
+                    highlightbackground=BORDER_COLOR,
+                    highlightthickness=1,
+                ).pack(side="left", padx=(0, 6))
+                tk.Label(
+                    color_row,
+                    text=f"Color: {matched_hex}",
+                    bg=BG_CARD,
+                    fg=TEXT_MUTED,
+                    font=("Consolas", 8),
+                ).pack(side="left")
+
+        elif item_cat == "Mods":
+            loaders = item.get("loaders") or []
+            loaders_text = ", ".join(loaders) if loaders else "Unknown"
+            tk.Label(
+                info_frame,
+                text=f"Loader: {loaders_text}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 10),
+                anchor="w",
+            ).pack(fill="x", pady=(0, 3))
+
+            versions = item.get("mc_versions") or []
+            versions_text = ", ".join(versions) if versions else "None"
+            ver_lbl = tk.Label(
+                info_frame,
+                text=f"Versions: {versions_text}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify="left",
+                wraplength=wrap_len,
+            )
+            ver_lbl.pack(fill="x")
+            info_wrap_labels.append(ver_lbl)
+
+        elif item_cat == "Modpacks":
+            mod_count = item.get("mod_count", "Unknown")
+            tk.Label(
+                info_frame,
+                text=f"Mod count: {mod_count}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 10),
+                anchor="w",
+            ).pack(fill="x", pady=(0, 3))
+
+            summary = item.get("summary") or "No description"
+            desc_lbl = tk.Label(
+                info_frame,
+                text=f"Description: {summary}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify="left",
+                wraplength=wrap_len,
+            )
+            desc_lbl.pack(fill="x", pady=(0, 3))
+            info_wrap_labels.append(desc_lbl)
+
+            mc_ver = item.get("mc_version") or "Unknown"
+            tk.Label(
+                info_frame,
+                text=f"Version: {mc_ver}",
+                bg=BG_CARD,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(fill="x")
+
+    # Scroll back to top whenever a new page/search loads
     results_canvas.yview_moveto(0)
 
 
 def update_pagination(data):
-    global current_page, total_pages
+    global current_page, total_pages, total_items_count
     pagination = data.get("pagination", {})
-    limit = pagination.get("limit", 0)
     current_page = pagination.get("page", current_page)
-    total_pages = max(1, pagination.get("total", 1))
+    total_pages = max(1, pagination.get("pages", 1))
+    total_items_count = pagination.get("total", 0)
 
-    page_info_label.configure(
-        text=f"{selected_category} per page: {limit}   |   Page {current_page} of {total_pages}"
+    current_page_label.configure(
+        text=f"Current Page: {current_page} / {total_pages}   ({RESULTS_PER_PAGE} per page)"
     )
     prev_btn.configure(state="normal" if current_page > 1 else "disabled")
     next_btn.configure(state="normal" if current_page < total_pages else "disabled")
 
 
 def run_search(page=1):
-    global current_page
+    """Run the API search in a background thread so the GUI stays smooth and responsive."""
+    global current_page, search_generation
     current_page = page
+    search_generation += 1
+    gen = search_generation
 
     query = main_search_entry.get_value()
     mc_version = version_search_entry.get_value()
     mod_name = mod_search_entry.get_value()
+    color_hex = selected_color_hex
+    category = selected_category
 
-    url = build_url(
-        category=selected_category,
-        query=query,
-        mc_version=mc_version,
-        mod_name=mod_name,
-        color_hex=selected_color_hex,
-        page=current_page,
-    )
+    search_btn.configure(state="disabled", text="Searching...")
+    prev_btn.configure(state="disabled")
+    next_btn.configure(state="disabled")
+    status_var.set(f"Searching {category} (page {page})...")
+    _show_message_in_results(f"Loading {category} (Page {page})...")
 
-    data = fetch_data(url)
-    showfounddata(data)
-    update_pagination(data)
+    def _worker():
+        try:
+            result = fetch_api_results(
+                category=category,
+                query=query,
+                mc_version=mc_version,
+                mod_name=mod_name,
+                color_hex=color_hex,
+                page=page,
+            )
+            error_msg = None
+        except Exception as exc:
+            result = None
+            error_msg = str(exc)
 
-    color_info = selected_color_hex if selected_color_hex else "None"
-    status_var.set(f"URL: {url}   |   Color Hex: {color_info}")
+        def _on_complete():
+            if gen != search_generation:
+                return
+            search_btn.configure(state="normal", text="Search")
+
+            if error_msg is not None:
+                _show_message_in_results(
+                    f"Could not fetch data from BlocksItems API:\n{error_msg}",
+                    color=TEXT_ERROR,
+                )
+                status_var.set(f"Error: {error_msg}")
+                prev_btn.configure(state="normal" if current_page > 1 else "disabled")
+                next_btn.configure(state="normal" if current_page < total_pages else "disabled")
+                return
+
+            # Keep blocksitems_API.data updated with latest response
+            bi.data = result
+            showfounddata(result, gen)
+            update_pagination(result)
+
+            extra_note = ""
+            if color_hex and category in ("Items", "Mods", "Modpacks"):
+                extra_note = "   |   Note: Color filter applies to Blocks / All"
+            status_var.set(f"Loaded: {result.get('url', '')}{extra_note}")
+
+        try:
+            root.after(0, _on_complete)
+        except tk.TclError:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def go_to_entered_page(_event=None):
@@ -392,36 +754,54 @@ def go_to_entered_page(_event=None):
     if page_text.isdigit():
         target_page = int(page_text)
         if 1 <= target_page <= total_pages:
-            run_search(page=target_page)
             goto_page_entry.delete(0, tk.END)
+            run_search(page=target_page)
             return
-    status_var.set(f"Please enter a valid page number between 1 and {total_pages}.")
+    status_var.set(f"Invalid page number. Enter a number between 1 and {total_pages}.")
 
 
 # =============================================================================
-# BUILD MAIN WINDOW
+# BUILD DARK-THEMED MAIN WINDOW
 # =============================================================================
 root = tk.Tk()
-root.title("Blocks & Items API Explorer")
-root.geometry("860x700")
-root.minsize(720, 560)
+root.title("Blocks & Items Explorer")
+root.geometry("920x740")
+root.minsize(760, 580)
 root.configure(bg=BG_MAIN)
 
-# --- Top Header ---
+# Dark scrollbar styling via ttk
+style = ttk.Style(root)
+style.theme_use("clam")
+style.configure(
+    "Dark.Vertical.TScrollbar",
+    gripcount=0,
+    background="#34384a",
+    darkcolor="#252834",
+    lightcolor="#34384a",
+    troughcolor=BG_PANEL,
+    bordercolor=BG_PANEL,
+    arrowcolor=TEXT_SECONDARY,
+)
+style.map(
+    "Dark.Vertical.TScrollbar",
+    background=[("active", "#484e66"), ("pressed", ACCENT)],
+)
+
+# --- Header ---
 header_frame = tk.Frame(root, bg=BG_MAIN)
 header_frame.pack(fill="x", padx=20, pady=(14, 6))
 
 tk.Label(
     header_frame,
-    text="Blocks & Items Search",
+    text="Blocks & Items Explorer",
     bg=BG_MAIN,
     fg=TEXT_PRIMARY,
     font=("Segoe UI", 16, "bold"),
-).pack(anchor="w")
+).pack(side="left")
 
-# --- Category Buttons (Items, Blocks, Mods, Modpacks, All) ---
-category_frame = tk.Frame(root, bg=BG_MAIN, padx=20, pady=6)
-category_frame.pack(fill="x")
+# --- 5 Category Buttons (Items, Blocks, Mods, Modpacks, All) ---
+category_frame = tk.Frame(root, bg=BG_MAIN)
+category_frame.pack(fill="x", padx=20, pady=(4, 8))
 
 category_buttons = {}
 for idx, cat in enumerate(CATEGORIES):
@@ -434,7 +814,7 @@ for idx, cat in enumerate(CATEGORIES):
         relief="flat",
         bd=0,
         padx=14,
-        pady=8,
+        pady=9,
         cursor="hand2",
         font=("Segoe UI", 10),
     )
@@ -442,7 +822,7 @@ for idx, cat in enumerate(CATEGORIES):
     category_frame.grid_columnconfigure(idx, weight=1)
     category_buttons[cat] = btn
 
-# --- Main Search Bar ---
+# --- Search Bar & Optional Filters Panel ---
 search_panel = tk.Frame(
     root,
     bg=BG_PANEL,
@@ -451,14 +831,15 @@ search_panel = tk.Frame(
     padx=14,
     pady=12,
 )
-search_panel.pack(fill="x", padx=20, pady=8)
+search_panel.pack(fill="x", padx=20, pady=(0, 10))
 
+# Main search row
 main_search_row = tk.Frame(search_panel, bg=BG_PANEL)
 main_search_row.pack(fill="x", pady=(0, 10))
 
 main_search_entry = PlaceholderEntry(
     main_search_row,
-    placeholder="Search for an item, block, mod, or modpack...",
+    placeholder="What Item are you looking for?",
     bg=BG_INPUT,
     fg=TEXT_PRIMARY,
     insertbackground=TEXT_PRIMARY,
@@ -479,20 +860,21 @@ search_btn = tk.Button(
     fg="#ffffff",
     activebackground=ACCENT_HOVER,
     activeforeground="#ffffff",
+    disabledforeground="#c9d1d9",
     relief="flat",
     bd=0,
-    padx=20,
+    padx=22,
     pady=6,
     cursor="hand2",
     font=("Segoe UI", 10, "bold"),
 )
 search_btn.pack(side="right")
 
-# --- Optional Filters Row (2 Smaller Searchbars + Color Picker) ---
+# Optional filters row: MC Version + Mod Name + Color Picker
 filters_row = tk.Frame(search_panel, bg=BG_PANEL)
 filters_row.pack(fill="x")
 
-# 1. Optional Minecraft Version Searchbar
+# 1. Optional Minecraft Version search bar
 version_group = tk.Frame(filters_row, bg=BG_PANEL)
 version_group.pack(side="left", padx=(0, 14))
 
@@ -520,7 +902,7 @@ version_search_entry = PlaceholderEntry(
 version_search_entry.pack(ipady=4)
 version_search_entry.bind("<Return>", lambda _e: run_search(page=1))
 
-# 2. Optional Mod Name Searchbar
+# 2. Optional Mod Name search bar
 mod_group = tk.Frame(filters_row, bg=BG_PANEL)
 mod_group.pack(side="left", padx=(0, 18))
 
@@ -554,7 +936,7 @@ color_group.pack(side="left")
 
 tk.Label(
     color_group,
-    text="Color (optional)",
+    text="Color (optional - Blocks / All)",
     bg=BG_PANEL,
     fg=TEXT_SECONDARY,
     font=("Segoe UI", 8),
@@ -610,7 +992,7 @@ clear_color_btn = tk.Button(
     command=clear_color,
     bg=BTN_CLEAR,
     fg=BTN_CLEAR_TEXT,
-    activebackground="#5e3e46",
+    activebackground=BTN_CLEAR_HOVER,
     activeforeground=BTN_CLEAR_TEXT,
     relief="flat",
     bd=0,
@@ -621,21 +1003,21 @@ clear_color_btn = tk.Button(
 )
 clear_color_btn.pack(side="left")
 
-# --- Middle Window: Found Items + Picture Space ---
+# --- Middle Scrollable Results Window ---
 results_outer = tk.Frame(
     root,
     bg=BG_PANEL,
     highlightbackground=BORDER_COLOR,
     highlightthickness=1,
 )
-results_outer.pack(fill="both", expand=True, padx=20, pady=(4, 8))
+results_outer.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
 results_header = tk.Frame(results_outer, bg=BG_PANEL, padx=12, pady=8)
 results_header.pack(fill="x")
 
 results_header_label = tk.Label(
     results_header,
-    text="Found Items",
+    text="Results",
     bg=BG_PANEL,
     fg=TEXT_PRIMARY,
     font=("Segoe UI", 10, "bold"),
@@ -653,10 +1035,11 @@ results_canvas = tk.Canvas(
     highlightthickness=0,
     bd=0,
 )
-results_scrollbar = tk.Scrollbar(
+results_scrollbar = ttk.Scrollbar(
     canvas_wrapper,
     orient="vertical",
     command=results_canvas.yview,
+    style="Dark.Vertical.TScrollbar",
 )
 results_canvas.configure(yscrollcommand=results_scrollbar.set)
 
@@ -673,6 +1056,10 @@ def _on_container_configure(_event):
 
 def _on_canvas_configure(event):
     results_canvas.itemconfig(canvas_window, width=event.width)
+    new_wrap = max(260, event.width - 170)
+    for lbl in info_wrap_labels:
+        if lbl.winfo_exists():
+            lbl.configure(wraplength=new_wrap)
 
 
 def _on_mousewheel(event):
@@ -685,74 +1072,51 @@ results_container.bind("<Configure>", _on_container_configure)
 results_canvas.bind("<Configure>", _on_canvas_configure)
 results_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-# --- Bottom Pagination Bar ---
-pagination_frame = tk.Frame(root, bg=BG_MAIN, padx=20, pady=4)
-pagination_frame.pack(fill="x")
+# --- Bottom Pagination Bar (Go to Page + Current Page right next to it) ---
+pagination_bar = tk.Frame(
+    root,
+    bg=BG_PANEL,
+    highlightbackground=BORDER_COLOR,
+    highlightthickness=1,
+    padx=14,
+    pady=8,
+)
+pagination_bar.pack(fill="x", padx=20, pady=(0, 8))
 
 prev_btn = tk.Button(
-    pagination_frame,
+    pagination_bar,
     text="< Prev",
     command=lambda: run_search(page=max(1, current_page - 1)),
     bg=BTN_INACTIVE,
     fg=TEXT_PRIMARY,
     activebackground=BTN_INACTIVE_HOVER,
     activeforeground=TEXT_PRIMARY,
+    disabledforeground=TEXT_MUTED,
     relief="flat",
     bd=0,
     padx=12,
     pady=4,
     cursor="hand2",
     font=("Segoe UI", 9),
+    state="disabled",
 )
 prev_btn.pack(side="left")
 
-page_info_label = tk.Label(
-    pagination_frame,
-    text="Page 1 of 1",
-    bg=BG_MAIN,
+# Center section: Go to Page input right next to Current Page indicator
+page_center = tk.Frame(pagination_bar, bg=BG_PANEL)
+page_center.pack(side="left", expand=True)
+
+tk.Label(
+    page_center,
+    text="Go to Page:",
+    bg=BG_PANEL,
     fg=TEXT_SECONDARY,
     font=("Segoe UI", 9),
-)
-page_info_label.pack(side="left", padx=12)
-
-next_btn = tk.Button(
-    pagination_frame,
-    text="Next >",
-    command=lambda: run_search(page=min(total_pages, current_page + 1)),
-    bg=BTN_INACTIVE,
-    fg=TEXT_PRIMARY,
-    activebackground=BTN_INACTIVE_HOVER,
-    activeforeground=TEXT_PRIMARY,
-    relief="flat",
-    bd=0,
-    padx=12,
-    pady=4,
-    cursor="hand2",
-    font=("Segoe UI", 9),
-)
-next_btn.pack(side="left")
-
-# Go-to-page controls on the right
-goto_btn = tk.Button(
-    pagination_frame,
-    text="Go",
-    command=go_to_entered_page,
-    bg=BTN_INACTIVE,
-    fg=TEXT_PRIMARY,
-    activebackground=BTN_INACTIVE_HOVER,
-    activeforeground=TEXT_PRIMARY,
-    relief="flat",
-    bd=0,
-    padx=10,
-    pady=4,
-    cursor="hand2",
-    font=("Segoe UI", 9),
-)
-goto_btn.pack(side="right")
+).pack(side="left", padx=(0, 6))
 
 goto_page_entry = tk.Entry(
-    pagination_frame,
-    width=5,
+    page_center,
+    width=6,
     bg=BG_INPUT,
     fg=TEXT_PRIMARY,
     insertbackground=TEXT_PRIMARY,
@@ -763,33 +1127,83 @@ goto_page_entry = tk.Entry(
     highlightthickness=1,
     justify="center",
 )
-goto_page_entry.pack(side="right", padx=6, ipady=3)
+goto_page_entry.pack(side="left", ipady=3)
 goto_page_entry.bind("<Return>", go_to_entered_page)
 
-tk.Label(
-    pagination_frame,
-    text="Go to Page:",
-    bg=BG_MAIN,
-    fg=TEXT_SECONDARY,
-    font=("Segoe UI", 9),
-).pack(side="right")
+goto_btn = tk.Button(
+    page_center,
+    text="Go",
+    command=go_to_entered_page,
+    bg=ACCENT,
+    fg="#ffffff",
+    activebackground=ACCENT_HOVER,
+    activeforeground="#ffffff",
+    relief="flat",
+    bd=0,
+    padx=10,
+    pady=3,
+    cursor="hand2",
+    font=("Segoe UI", 9, "bold"),
+)
+goto_btn.pack(side="left", padx=(6, 18))
 
-# --- Status Bar (shows placeholder URL & saved color hex) ---
+current_page_label = tk.Label(
+    page_center,
+    text=f"Current Page: 1 / 1   ({RESULTS_PER_PAGE} per page)",
+    bg=BG_PANEL,
+    fg=TEXT_PRIMARY,
+    font=("Segoe UI", 9, "bold"),
+)
+current_page_label.pack(side="left")
+
+next_btn = tk.Button(
+    pagination_bar,
+    text="Next >",
+    command=lambda: run_search(page=min(total_pages, current_page + 1)),
+    bg=BTN_INACTIVE,
+    fg=TEXT_PRIMARY,
+    activebackground=BTN_INACTIVE_HOVER,
+    activeforeground=TEXT_PRIMARY,
+    disabledforeground=TEXT_MUTED,
+    relief="flat",
+    bd=0,
+    padx=12,
+    pady=4,
+    cursor="hand2",
+    font=("Segoe UI", 9),
+    state="disabled",
+)
+next_btn.pack(side="right")
+
+# --- Bottom Status Bar ---
 status_var = tk.StringVar(value="Ready.")
 status_bar = tk.Label(
     root,
     textvariable=status_var,
-    bg="#16171d",
+    bg="#0e0f13",
     fg=TEXT_MUTED,
     font=("Consolas", 8),
     anchor="w",
-    padx=12,
+    padx=14,
     pady=5,
 )
-status_bar.pack(fill="x", side="bottom", pady=(6, 0))
+status_bar.pack(fill="x", side="bottom")
 
-# Initialize default category and display placeholder items on startup
-select_category("Items")
-run_search(page=1)
 
-root.mainloop()
+def _on_close():
+    image_executor.shutdown(wait=False, cancel_futures=True)
+    http_session.close()
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", _on_close)
+
+# Initialize default category & welcome prompt
+select_category(CATEGORIES[0])
+_show_message_in_results(
+    "Choose a category above (Items, Blocks, Mods, Modpacks, or All),\n"
+    "type your search term, and press Enter or click Search."
+)
+
+if __name__ == "__main__":
+    root.mainloop()
