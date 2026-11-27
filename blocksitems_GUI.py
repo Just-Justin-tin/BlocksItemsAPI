@@ -1,5 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 from io import BytesIO
+from pathlib import Path
+import sys
 import threading
 import tkinter as tk
 from tkinter import colorchooser, ttk
@@ -9,8 +12,16 @@ import blocksitems_API as bi
 
 
 # =============================================================================
-# API CONFIGURATION (pulled directly from blocksitems_API.py)
+# API & APP CONFIGURATION (pulled directly from blocksitems_API.py)
 # =============================================================================
+APP_DIR = Path(__file__).resolve().parent
+APP_ICON_FILES = (
+    "blocksitems_icon.ico",
+    "blocksitems_icon.png",
+    "blocksitems_icon.jpg",
+    "blocksitems_icon.jpeg",
+    "blocksitems_icon.webp",
+)
 BASE_URL = bi.url.rstrip("/")
 CATEGORIES = list(bi.categories)  # ["Items", "Blocks", "Mods", "Modpacks", "All"]
 SUB_CATEGORIES = [c for c in CATEGORIES if c != "All"]
@@ -718,13 +729,71 @@ def go_to_entered_page(_event=None):
 
 
 # =============================================================================
+# CUSTOM WINDOW & TASKBAR ICON
+# =============================================================================
+def set_windows_taskbar_app_id(app_id="blocksitems.explorer.gui"):
+    """Assign a custom AppUserModelID on Windows so the taskbar uses our icon instead of python.exe's."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+
+
+def apply_app_icon(window):
+    """
+    Load a custom window & taskbar icon from the same folder as blocksitems_GUI.py.
+    Drop a file named blocksitems_icon.ico or blocksitems_icon.png (or .jpg/.webp)
+    next to this script to use it automatically.
+    """
+    icon_path = next((APP_DIR / name for name in APP_ICON_FILES if (APP_DIR / name).is_file()), None)
+    if icon_path is None:
+        return
+
+    # On Windows, .ico files can be applied directly via iconbitmap
+    if icon_path.suffix.lower() == ".ico":
+        try:
+            window.iconbitmap(default=str(icon_path))
+            return
+        except tk.TclError:
+            pass
+
+    # For .png/.jpg/.webp (or as a fallback for .ico), build multi-size icons via Pillow
+    try:
+        with Image.open(icon_path) as raw_img:
+            img = raw_img.convert("RGBA")
+        resample = (
+            Image.Resampling.NEAREST
+            if max(img.size) <= 32
+            else Image.Resampling.LANCZOS
+        )
+        icon_photos = []
+        for size in (256, 64, 32, 16):
+            scale = min(size / img.width, size / img.height)
+            new_w = max(1, round(img.width * scale))
+            new_h = max(1, round(img.height * scale))
+            resized = img.resize((new_w, new_h), resample)
+            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            canvas.paste(resized, ((size - new_w) // 2, (size - new_h) // 2), resized)
+            icon_photos.append(ImageTk.PhotoImage(canvas))
+
+        window._app_icon_images = icon_photos  # Keep references alive so Tk doesn't drop the icon
+        window.iconphoto(True, *icon_photos)
+    except Exception:
+        pass
+
+
+# =============================================================================
 # BUILD DARK-THEMED MAIN WINDOW
 # =============================================================================
+set_windows_taskbar_app_id()
+
 root = tk.Tk()
 root.title("Blocks & Items Explorer")
 root.geometry("920x740")
 root.minsize(760, 580)
 root.configure(bg=BG_MAIN)
+apply_app_icon(root)
 
 # Dark scrollbar styling via ttk
 style = ttk.Style(root)
