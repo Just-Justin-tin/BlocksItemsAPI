@@ -113,84 +113,22 @@ class PlaceholderEntry(tk.Entry):
 
 
 # =============================================================================
-# COLOR HELPERS
-# =============================================================================
-def _hex_to_rgb(hex_str):
-    cleaned = hex_str.lstrip("#")
-    if len(cleaned) != 6:
-        return None
-    try:
-        return (int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16))
-    except ValueError:
-        return None
-
-
-def _color_distance(hex_a, hex_b):
-    rgb_a = _hex_to_rgb(hex_a)
-    rgb_b = _hex_to_rgb(hex_b)
-    if not rgb_a or not rgb_b:
-        return float("inf")
-    return sum((a - b) ** 2 for a, b in zip(rgb_a, rgb_b))
-
-
-def _block_color_distance(item, target_hex):
-    colors = item.get("colors") or {}
-    best = float("inf")
-    dominant = colors.get("dominant")
-    if dominant:
-        best = min(best, _color_distance(dominant, target_hex))
-    for swatch in colors.get("palette") or []:
-        swatch_hex = swatch.get("hex")
-        if swatch_hex:
-            best = min(best, _color_distance(swatch_hex, target_hex))
-    return best
-
-
-# =============================================================================
-# REAL API REQUESTS (using blocksitems_API.url and blocksitems_API.requests)
+# REAL API REQUESTS (using blocksitems_API.py for URL, requests, and filters)
 # =============================================================================
 def _fetch_single_category(category, query, mc_version, mod_name, color_hex, page):
     """Fetch one page (50 results) for a single category from BlocksItems API."""
-    mod_slug = mod_name.strip().lower().replace(" ", "-") if mod_name else ""
-
-    # Color search endpoint when filtering Blocks purely by color
-    if category == "Blocks" and color_hex and not query:
-        params = {
-            "hex": color_hex.lstrip("#"),
-            "limit": RESULTS_PER_PAGE,
-        }
-        response = http_session.get(f"{BASE_URL}/colors/search", params=params, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
-
-        results = []
-        for entry in payload.get("data", []):
-            block = entry.get("block") or {}
-            if mc_version and mc_version not in (block.get("mc_versions") or []):
-                continue
-            if mod_slug:
-                b_mod = block.get("mod") or {}
-                mod_match = (
-                    mod_slug in (b_mod.get("slug") or "").lower()
-                    or mod_name.lower() in (b_mod.get("display_name") or "").lower()
-                )
-                if not mod_match:
-                    continue
-            block_copy = dict(block)
-            block_copy["_category"] = "Blocks"
-            block_copy["_matched_hex"] = entry.get("hex")
-            results.append(block_copy)
-
-        return {
-            "data": results[:RESULTS_PER_PAGE],
-            "pagination": {
-                "page": 1,
-                "limit": RESULTS_PER_PAGE,
-                "pages": 1,
-                "total": len(results),
-            },
-            "url": response.url,
-        }
+    # Dominant color filtering for Items and Blocks (handled in blocksitems_API.py)
+    if color_hex and category in ("Items", "Blocks"):
+        return bi.search_with_color_filter(
+            category=category,
+            query=query,
+            mc_version=mc_version,
+            mod_name=mod_name,
+            color_hex=color_hex,
+            page=page,
+            limit=RESULTS_PER_PAGE,
+            session=http_session,
+        )
 
     # Standard category endpoints matching blocksitems_API.py
     endpoint = f"{BASE_URL}/{category.lower()}"
@@ -201,14 +139,8 @@ def _fetch_single_category(category, query, mc_version, mod_name, color_hex, pag
     if query:
         params["q"] = query.lower()
 
-    # Optional filters supported by each endpoint
-    if category in ("Items", "Blocks", "Modpacks"):
-        if mc_version:
-            params["mc_version"] = mc_version
-        if mod_slug:
-            params["mod"] = mod_slug
-    elif category == "Mods" and mod_name and not query:
-        params["q"] = mod_name.lower()
+    # Optional MC Version & Mod Name query filters (in blocksitems_API.py)
+    bi.apply_filter_params(category, params, query, mc_version, mod_name)
 
     response = http_session.get(endpoint, params=params, timeout=15)
     response.raise_for_status()
@@ -220,13 +152,8 @@ def _fetch_single_category(category, query, mc_version, mod_name, color_hex, pag
         item_copy["_category"] = category
         items.append(item_copy)
 
-    # Local version filter for /mods (API /mods endpoint doesn't have an mc_version param)
-    if category == "Mods" and mc_version:
-        items = [it for it in items if mc_version in (it.get("mc_versions") or [])]
-
-    # Sort returned blocks by color closeness when combining text query + color picker
-    if category == "Blocks" and color_hex:
-        items.sort(key=lambda it: _block_color_distance(it, color_hex))
+    # Local MC Version filter for Mods (in blocksitems_API.py)
+    items = bi.apply_local_filters(category, items, mc_version=mc_version, color_hex=color_hex)
 
     pagination = payload.get("pagination") or {}
     return {
@@ -246,9 +173,39 @@ def fetch_api_results(category, query, mc_version, mod_name, color_hex, page):
     if category != "All":
         return _fetch_single_category(category, query, mc_version, mod_name, color_hex, page)
 
-    # For "All" with only a color picked (no search query), use /colors/search directly
-    if color_hex and not query:
-        return _fetch_single_category("Blocks", "", mc_version, mod_name, color_hex, 1)
+    # When filtering "All" by color, search both Items and Blocks by dominant color in parallel
+    if color_hex:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            item_future = pool.submit(
+                bi.search_with_color_filter,
+                "Items", query, mc_version, mod_name, color_hex, 1, 500, http_session,
+            )
+            block_future = pool.submit(
+                bi.search_with_color_filter,
+                "Blocks", query, mc_version, mod_name, color_hex, 1, 500, http_session,
+            )
+            combined = []
+            for fut in (item_future, block_future):
+                try:
+                    combined.extend(fut.result()["data"])
+                except Exception:
+                    pass
+
+        combined.sort(key=lambda it: bi.dominant_color_distance(it, color_hex))
+        total = len(combined)
+        total_pages_all = max(1, (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+        safe_page = min(max(1, page), total_pages_all)
+        start = (safe_page - 1) * RESULTS_PER_PAGE
+        return {
+            "data": combined[start:start + RESULTS_PER_PAGE],
+            "pagination": {
+                "page": safe_page,
+                "limit": RESULTS_PER_PAGE,
+                "pages": total_pages_all,
+                "total": total,
+            },
+            "url": f"{BASE_URL}/[items|blocks]?q={query.lower()}&dominant_color={color_hex}&page={safe_page}",
+        }
 
     # Same logic as blocksitems_API.py "All": query Items, Blocks, Mods, Modpacks
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -581,8 +538,8 @@ def showfounddata(data, gen):
             ver_lbl.pack(fill="x")
             info_wrap_labels.append(ver_lbl)
 
-            # Show matched color badge if returned from Color Search or dominant block color
-            matched_hex = item.get("_matched_hex") or (item.get("colors") or {}).get("dominant")
+            # Show dominant color badge when filtering by color (works for Items and Blocks)
+            matched_hex = bi.get_dominant_hex(item)
             if matched_hex and selected_color_hex:
                 color_row = tk.Frame(info_frame, bg=BG_CARD)
                 color_row.pack(fill="x", pady=(4, 0))
@@ -596,7 +553,7 @@ def showfounddata(data, gen):
                 ).pack(side="left", padx=(0, 6))
                 tk.Label(
                     color_row,
-                    text=f"Color: {matched_hex}",
+                    text=f"Dominant Color: {matched_hex}",
                     bg=BG_CARD,
                     fg=TEXT_MUTED,
                     font=("Consolas", 8),
@@ -737,8 +694,8 @@ def run_search(page=1):
             update_pagination(result)
 
             extra_note = ""
-            if color_hex and category in ("Items", "Mods", "Modpacks"):
-                extra_note = "   |   Note: Color filter applies to Blocks / All"
+            if color_hex and category in ("Mods", "Modpacks"):
+                extra_note = "   |   Note: Dominant color filter applies to Items, Blocks, and All"
             status_var.set(f"Loaded: {result.get('url', '')}{extra_note}")
 
         try:
@@ -936,7 +893,7 @@ color_group.pack(side="left")
 
 tk.Label(
     color_group,
-    text="Color (optional - Blocks / All)",
+    text="Color (optional - Items / Blocks / All)",
     bg=BG_PANEL,
     fg=TEXT_SECONDARY,
     font=("Segoe UI", 8),
